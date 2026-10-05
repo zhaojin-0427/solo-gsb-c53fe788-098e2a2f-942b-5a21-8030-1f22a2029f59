@@ -18,12 +18,21 @@
 3. ``(C, M, Y, K)`` 偏移四元组字典序。
 
 只有最优解的 ΔE00 不超过给定非负容差时才视为**可达**，否则不产出成品 TIFF。
+
+内存边界：搜索期间“偏移后 CMYK 四元组 -> Lab”的回算结果在同一请求内
+跨候选复用，但缓存为**容量受限的 LRU**（见 :class:`_BoundedLabCache`）——
+高多样性选区 + 宽偏移约束下新见色值持续淘汰最旧条目，常驻内存以容量封顶，
+不会随候选数无限增长；淘汰只影响速度，不改变任何数值结果（同一 CMYK 在
+同一 transform 下的 Lab 由 LittleCMS 确定性给出，重算逐位一致）。
 """
 from __future__ import annotations
 
 import hashlib
 import io
 import json
+import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -178,16 +187,90 @@ def _feasible_offsets(roi: np.ndarray, max_shift: int, tac_limit: int) -> np.nda
     return candidates[keep]
 
 
+def _env_int(name: str, default: int) -> int:
+    """读取正整数环境变量；缺失/非法时回退默认值（>=1）。"""
+    try:
+        return max(1, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+# 单次搜索/复核中“偏移后 CMYK -> Lab”缓存的常驻条目上限。
+# 每条约 150 字节（int 键 + 24 字节 Lab 字节串 + 哈希表开销），
+# 默认 20 万条 ≈ 30MB；高多样性选区下 LRU 淘汰最旧条目，内存不再随
+# 候选数线性增长（此前无界字典在病态输入下可膨胀到数十 GB 直至进程被杀）。
+_LAB_CACHE_CAPACITY = _env_int("SPD_RETOUCH_LAB_CACHE_ENTRIES", 200_000)
+# 同时进行的修色搜索/复核上限：并发请求排队而非并行堆积缓存，
+# 进程级常驻内存以 “并发数 × 缓存容量” 封顶。
+_MAX_CONCURRENT_SEARCHES = _env_int("SPD_RETOUCH_MAX_CONCURRENT", 2)
+_SEARCH_GATE = threading.BoundedSemaphore(_MAX_CONCURRENT_SEARCHES)
+
+
+class _BoundedLabCache:
+    """同一请求内跨候选共享的 ``CMYK -> Lab`` 结果缓存（LRU，容量受限）。
+
+    复用边界：单次搜索/复核期间，同一（偏移后）CMYK 四元组只让 LittleCMS
+    回算一次，命中即复用；缓存随请求结束整体释放，不跨请求驻留。
+
+    淘汰边界：条目数达到 ``capacity`` 时按最久未使用（LRU）逐出最旧条目。
+    缓存只是性能结构——同一 CMYK 在同一 transform 下的 Lab 由 lcms 确定性
+    给出，逐出后重算得到**逐位相同**的结果，因此淘汰不改变任何数值输出，
+    小选区（条目数远低于容量、从不触发淘汰）与原无界算法结果完全一致。
+
+    值以 24 字节 ``bytes``（3 个 float64 的原始位）存储：既精确，又避免
+    缓存行视图把整批 transform 输出数组一并留在内存。
+
+    底层用 ``OrderedDict``：``move_to_end`` / ``popitem(last=False)`` 均为
+    真正的 O(1)（双向链表），持续“淘汰 + 写入”的高多样性场景下每个候选的
+    开销保持恒定——普通 dict 的 ``next(iter(d))`` 会因头部删除占位符累积
+    而退化为 O(n) 扫描，不可用。
+    """
+
+    __slots__ = ("_capacity", "_entries")
+
+    def __init__(self, capacity: int):
+        self._capacity = max(1, int(capacity))
+        # 有序映射：末尾 = 最近使用，头部 = 最久未使用（下一个被淘汰）。
+        self._entries: OrderedDict[int, bytes] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def get(self, key: int) -> np.ndarray | None:
+        """命中返回 (3,) float64 Lab 并标记为最近使用；未命中返回 None。"""
+        try:
+            raw = self._entries[key]
+        except KeyError:
+            return None
+        self._entries.move_to_end(key)
+        return np.frombuffer(raw, dtype=np.float64)
+
+    def put(self, key: int, lab: np.ndarray) -> None:
+        """写入一条 Lab 结果；超容量时先逐出最久未使用条目。"""
+        if key in self._entries:
+            self._entries.move_to_end(key)
+        elif len(self._entries) >= self._capacity:
+            self._entries.popitem(last=False)
+        self._entries[key] = np.ascontiguousarray(
+            lab, dtype=np.float64
+        ).tobytes()
+
+
 def _mean_lab_for_offset(
     flat_cmyk: np.ndarray,
     offset: np.ndarray,
     lab_xf,
-    lab_cache: dict[int, np.ndarray],
+    lab_cache: _BoundedLabCache,
 ) -> np.ndarray:
     """偏移后选区 CMYK -> 像素加权平均 Lab（D50 double）。
 
     相同（偏移后）CMYK 四元组只让 LittleCMS 回算一次；相邻候选间大量重叠的
     油墨组合直接在 ``lab_cache`` 命中，使平坦/重复色区域的搜索非常便宜。
+    缓存容量受限（LRU 淘汰），高多样性选区下常驻内存有界且结果不变。
     查表/加权均为 NumPy 操作，无逐像素 Python 循环。
     """
     shifted = np.clip(
@@ -200,25 +283,31 @@ def _mean_lab_for_offset(
         | (shifted[:, 2].astype(np.uint64) << 16)
         | (shifted[:, 3].astype(np.uint64) << 24)
     )
-    unique_keys, inverse, counts = np.unique(
-        keys, return_inverse=True, return_counts=True
-    )
+    unique_keys, counts = np.unique(keys, return_counts=True)
 
     key_list = unique_keys.tolist()
-    missing_idx = [i for i, k in enumerate(key_list) if k not in lab_cache]
-    if missing_idx:
-        miss = np.empty((len(missing_idx), 4), dtype=np.uint8)
-        for row, i in enumerate(missing_idx):
-            k = key_list[i]
+    unique_lab: list = [None] * len(key_list)
+    miss_pos: list[int] = []
+    miss_keys: list[int] = []
+    for i, k in enumerate(key_list):
+        lab = lab_cache.get(k)
+        if lab is None:
+            miss_pos.append(i)
+            miss_keys.append(k)
+        else:
+            unique_lab[i] = lab
+    if miss_keys:
+        miss = np.empty((len(miss_keys), 4), dtype=np.uint8)
+        for row, k in enumerate(miss_keys):
             miss[row] = (k & 255, (k >> 8) & 255,
                          (k >> 16) & 255, (k >> 24) & 255)
         labs = lab_xf(miss)
-        for i, lab in zip(missing_idx, labs):
-            lab_cache[key_list[i]] = lab
+        for pos, k, lab in zip(miss_pos, miss_keys, labs):
+            lab_cache.put(k, lab)
+            unique_lab[pos] = lab
 
-    unique_lab = np.stack([lab_cache[k] for k in key_list])
     weights = (counts.astype(np.float64) / counts.sum())[:, None]
-    return (unique_lab * weights).sum(axis=0)
+    return (np.stack(unique_lab) * weights).sum(axis=0)
 
 
 def clip_region(cmyk_full: np.ndarray, req: RetouchRequest) -> tuple[int, int, int, int]:
@@ -277,7 +366,18 @@ def compute_residual_stats(lab_xf, roi_before: np.ndarray, roi_after: np.ndarray
 
 
 def run_retouch(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
-    """执行搜索并返回可直接落盘/展示的修色结果字典。"""
+    """执行搜索并返回可直接落盘/展示的修色结果字典。
+
+    首次搜索始终评估**全部**可行偏移；搜索在全局信号量下进行——并发修色
+    请求排队而非并行堆积缓存，进程级常驻内存以
+    ``_MAX_CONCURRENT_SEARCHES × _LAB_CACHE_CAPACITY`` 封顶。
+    """
+    with _SEARCH_GATE:
+        return _run_retouch_search(req, ctx, press_bytes)
+
+
+def _run_retouch_search(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
+    """run_retouch 的搜索主体（已持有 _SEARCH_GATE）。"""
     meta = ctx["meta"]
     cmyk_full = ctx["cmyk"]
 
@@ -299,7 +399,7 @@ def run_retouch(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
         de_before_target = float(colorscience.ciede2000(
             target[None, None, :], baseline_mean_lab[None, None, :])[0, 0])
 
-        lab_cache: dict[int, np.ndarray] = {}
+        lab_cache = _BoundedLabCache(_LAB_CACHE_CAPACITY)
         mean_labs = np.empty((candidates.shape[0], 3), dtype=np.float64)
         for gi, off in enumerate(candidates):
             mean_labs[gi] = _mean_lab_for_offset(flat, off, lab_xf, lab_cache)
@@ -539,6 +639,17 @@ _SAMPLE_CANDIDATES = 2000
 def verify_cache(report: object, retouch_id: str, fingerprint: dict,
                  base: Path, ctx: dict, req: RetouchRequest,
                  press_bytes: bytes, display_bytes: bytes) -> bool:
+    """缓存命中核对入口：与首次搜索共用并发闸门与受限 Lab 缓存。"""
+    with _SEARCH_GATE:
+        return _verify_cache_checks(
+            report, retouch_id, fingerprint, base, ctx, req,
+            press_bytes, display_bytes,
+        )
+
+
+def _verify_cache_checks(report: object, retouch_id: str, fingerprint: dict,
+                         base: Path, ctx: dict, req: RetouchRequest,
+                         press_bytes: bytes, display_bytes: bytes) -> bool:
     """逐项核对缓存报告/预览/成品与**本次请求**的实际绑定。
 
     不仅核对指纹、任务 ID 与文件存在，还核对：
@@ -695,7 +806,7 @@ def verify_cache(report: object, retouch_id: str, fingerprint: dict,
                         [candidates[near],
                          candidates[::step][:_SAMPLE_CANDIDATES]], axis=0
                     ), axis=0)
-                lab_cache: dict[int, np.ndarray] = {}
+                lab_cache = _BoundedLabCache(_LAB_CACHE_CAPACITY)
                 decorated = []
                 for off in sample:
                     mean_lab = _mean_lab_for_offset(flat, off, lab_xf, lab_cache)

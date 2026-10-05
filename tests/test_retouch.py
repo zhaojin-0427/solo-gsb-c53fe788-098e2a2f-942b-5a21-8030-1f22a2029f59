@@ -685,3 +685,190 @@ def test_identical_request_after_verification_remains_stable(client, ids):
     d1 = _retouch(client, job["job_id"], **kw).json()
     for _ in range(3):
         assert _retouch(client, job["job_id"], **kw).json() == d1
+
+
+# --------------------------------------------------------------------------
+# 跨候选 Lab 缓存的复用/淘汰边界：容量受限（LRU），淘汰不改变数值结果；
+# 高多样性选区 + 宽偏移约束下常驻内存有界，不再把进程拖到被系统杀掉。
+# --------------------------------------------------------------------------
+
+def test_bounded_lab_cache_evicts_lru_and_keeps_exact_values():
+    """容量封顶、LRU 淘汰顺序、取值逐位精确。"""
+    from app.retouch import _BoundedLabCache
+    cache = _BoundedLabCache(3)
+    labs = {k: np.array([k * 1.25, k - 0.5, -k * 0.75], dtype=np.float64)
+            for k in range(5)}
+    for k in (0, 1, 2):
+        cache.put(k, labs[k])
+    assert len(cache) == 3
+    assert cache.get(9) is None
+    # 访问 0 使其成为最近使用；此时最久未用的是 1。
+    assert np.array_equal(cache.get(0), labs[0])
+    cache.put(3, labs[3])  # 超容量 -> 淘汰 1
+    assert len(cache) == 3
+    assert cache.get(1) is None
+    # 值逐位一致（不是近似）。
+    assert cache.get(0).tobytes() == labs[0].tobytes()
+    assert cache.get(2).tobytes() == labs[2].tobytes()
+    assert cache.get(3).tobytes() == labs[3].tobytes()
+    # 重复写入同键只刷新位置，不增加条目；再次淘汰落在最旧的 2 上。
+    cache.put(0, labs[0])
+    assert len(cache) == 3
+    cache.put(4, labs[4])
+    assert cache.get(2) is None
+    assert cache.get(0) is not None
+    # 容量下限为 1：仍可用，只是几乎不复用。
+    c1 = _BoundedLabCache(0)
+    c1.put(1, labs[1])
+    c1.put(2, labs[2])
+    assert len(c1) == 1 and c1.get(1) is None
+    assert np.array_equal(c1.get(2), labs[2])
+
+
+def test_mean_lab_matches_unbounded_reference_under_eviction():
+    """有界缓存（含持续淘汰的小容量）与原无界字典实现逐位一致。"""
+    from app import retouch as rt
+    press = lcms_native.build_demo_cmyk_profile_bytes()
+    rng = np.random.default_rng(20240601)
+    flat = rng.integers(0, 256, (1024, 4), dtype=np.uint8)
+    offsets = rng.integers(-8, 9, (200, 4), dtype=np.int16)
+
+    def reference(flat_cmyk, offset, lab_xf, cache):
+        # 修复前的无界 dict 实现，作为数值参照。
+        shifted = np.clip(
+            flat_cmyk.astype(np.int32) + offset[None, :].astype(np.int32),
+            0, 255,
+        ).astype(np.uint8)
+        keys = (
+            shifted[:, 0].astype(np.uint64)
+            | (shifted[:, 1].astype(np.uint64) << 8)
+            | (shifted[:, 2].astype(np.uint64) << 16)
+            | (shifted[:, 3].astype(np.uint64) << 24)
+        )
+        unique_keys, counts = np.unique(keys, return_counts=True)
+        key_list = unique_keys.tolist()
+        missing = [i for i, k in enumerate(key_list) if k not in cache]
+        if missing:
+            miss = np.empty((len(missing), 4), dtype=np.uint8)
+            for row, i in enumerate(missing):
+                k = key_list[i]
+                miss[row] = (k & 255, (k >> 8) & 255,
+                             (k >> 16) & 255, (k >> 24) & 255)
+            labs = lab_xf(miss)
+            for i, lab in zip(missing, labs):
+                cache[key_list[i]] = lab
+        unique_lab = np.stack([cache[k] for k in key_list])
+        weights = (counts.astype(np.float64) / counts.sum())[:, None]
+        return (unique_lab * weights).sum(axis=0)
+
+    with lcms_native.lab_transform(
+            "CMYK", press, "relative_colorimetric") as lab_xf:
+        ref_cache: dict = {}
+        bounded = rt._BoundedLabCache(50_000)
+        tiny = rt._BoundedLabCache(32)  # 每个候选都强制淘汰
+        for off in offsets:
+            expected = reference(flat, off, lab_xf, ref_cache)
+            got = rt._mean_lab_for_offset(flat, off, lab_xf, bounded)
+            got_tiny = rt._mean_lab_for_offset(flat, off, lab_xf, tiny)
+            assert np.array_equal(got, expected)
+            assert np.array_equal(got_tiny, expected)
+        # 无界参照确实持续膨胀；有界缓存始终不超容量。
+        assert len(ref_cache) > 100_000
+        assert len(bounded) <= bounded.capacity
+        assert len(tiny) <= 32
+
+
+def _noise_png(size=48, seed=20240607):
+    rng = np.random.default_rng(seed)
+    arr = rng.integers(0, 256, (size, size, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _run_noise_job(client, ids, size=48):
+    r = client.post(
+        "/api/jobs",
+        files={"image": ("noise.png", _noise_png(size), "image/png")},
+        data={
+            "source_profile": ids["srgb"],
+            "press_profile": ids["cmyk"],
+            "display_profile": ids["display"],
+            "threshold": "3",
+        },
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_search_results_identical_with_tiny_lab_cache(client, ids, monkeypatch):
+    """LRU 淘汰不改变选优与报告数值：小容量缓存的搜索结果与默认容量一致。"""
+    from app import main
+    from app import retouch as rt
+    job = _run_noise_job(client, ids)
+    ctx = rt.load_job_context(main.JOB_DIR / job["job_id"])
+    press = client.app.state.state.pm.load_bytes(ids["cmyk"])
+    req = rt.validate_request({
+        "job_id": job["job_id"], "x": 0, "y": 0, "width": 48, "height": 48,
+        "target_lab": [55.0, 5.0, -5.0], "tolerance_de": 2.0,
+        "max_shift": 2, "tac_limit": 1020,
+    })
+    full = rt.run_retouch(req, ctx, press)
+    monkeypatch.setattr(rt, "_LAB_CACHE_CAPACITY", 16)
+    tiny = rt.run_retouch(req, ctx, press)
+    for key in ("rect", "pixel_count", "constraints", "feasible_offset_count",
+                "reachable", "best_offset_cmyk", "best_abs_shift_sum",
+                "residual"):
+        assert tiny[key] == full[key], key
+    assert np.array_equal(tiny["_cmyk_adjusted"], full["_cmyk_adjusted"])
+
+
+def test_high_diversity_roi_wide_shift_returns_report_and_previews(
+        client, ids, monkeypatch):
+    """高多样性选区 + 强制小缓存：返回报告与预览；同一请求复核后稳定复用。"""
+    from app import main
+    from app import retouch as rt
+    # 搜索与缓存命中复核共用同一容量上限；调小以强制两条路径都频繁淘汰。
+    monkeypatch.setattr(rt, "_LAB_CACHE_CAPACITY", 512)
+    job = _run_noise_job(client, ids)
+    body = {
+        "job_id": job["job_id"], "x": 0, "y": 0, "width": 48, "height": 48,
+        "target_lab": [55.0, 5.0, -5.0], "tolerance_de": 2.0,
+        "max_shift": 2, "tac_limit": 1020,
+    }
+    r1 = client.post("/api/retouch", json=body)
+    assert r1.status_code == 200, r1.text
+    d1 = r1.json()
+    assert d1["rect"] == {"x": 0, "y": 0, "width": 48, "height": 48}
+    assert d1["feasible_offset_count"] > 0
+
+    rep = client.get(d1["report_url"])
+    assert rep.status_code == 200
+    report = rep.json()
+    assert report["search"]["feasible_offset_count"] == \
+        d1["feasible_offset_count"]
+    assert report["profiles"]["press"]["sha256"] == \
+        job["report"]["profiles"]["press"]["sha256"]
+    assert client.get(d1["images"]["before"]).status_code == 200
+    assert client.get(d1["images"]["after"]).status_code == 200
+
+    if d1["reachable"]:
+        resp = client.get(d1["tiff"])
+        assert resp.status_code == 200
+        tif = np.asarray(Image.open(io.BytesIO(resp.content)))
+        orig = np.load(main.JOB_DIR / job["job_id"] / "cmyk.npy")
+        # 选区覆盖整幅 48x48 时无“选区外”；否则选区外字节必须不变。
+        assert tif.shape == orig.shape
+        off = np.array(d1["best_offset_cmyk"], dtype=np.int32)
+        diff = tif.astype(np.int32) - orig.astype(np.int32)
+        assert np.all(diff == off[None, None, :])
+    else:
+        assert d1["tiff"] is None
+        assert client.get(
+            f"/api/retouch/{d1['retouch_id']}/retouched.tif"
+        ).status_code == 422
+
+    # 同一请求重复提交：缓存命中复核（同样受限缓存）后逐字节复用。
+    r2 = client.post("/api/retouch", json=body)
+    assert r2.status_code == 200
+    assert r2.json() == d1
