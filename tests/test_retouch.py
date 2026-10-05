@@ -685,3 +685,206 @@ def test_identical_request_after_verification_remains_stable(client, ids):
     d1 = _retouch(client, job["job_id"], **kw).json()
     for _ in range(3):
         assert _retouch(client, job["job_id"], **kw).json() == d1
+
+
+# --------------------------------------------------------------------------
+# 内存风险：高多样性选区 + 宽偏移下，跨候选 Lab 缓存必须有界、可淘汰，
+# 且淘汰只影响速度不改变数值；首次搜索仍评估全部可行偏移。
+# --------------------------------------------------------------------------
+
+def test_bounded_lab_cache_evicts_without_growing():
+    """直接映射缓存的常驻槽位固定；写入远超容量的键也不增长，且未淘汰键正确。"""
+    from app.retouch import _BoundedLabCache
+    cap = 16
+    cache = _BoundedLabCache(capacity=cap)
+    assert cache.keys.shape[0] == cap and cache.labs.shape == (cap, 3)
+    keys = np.arange(1000, dtype=np.uint64) * 7 + 1
+    labs = np.stack([keys.astype(np.float64) % 97,
+                     keys.astype(np.float64) % 89,
+                     keys.astype(np.float64) % 83], axis=1)
+    cache.insert(keys, labs,
+                 cache.lookup(keys)[2], np.zeros(keys.shape[0], dtype=bool))
+    # 常驻内存恒定：底层数组形状不随插入条目数变化。
+    assert cache.keys.shape == (cap,) and cache.labs.shape == (cap, 3)
+    # 仍在槽内（未被同槽后写键覆盖）的键取回值必须逐位正确。
+    remaining = 0
+    for k, lab in zip(keys.tolist(), labs):
+        got = cache.get(int(k))
+        if got is not None:
+            remaining += 1
+            assert np.array_equal(got, lab)
+    assert 0 < remaining <= cap
+
+
+def test_bounded_cache_eviction_keeps_mean_lab_results_exact():
+    """小到必然发生淘汰的缓存，逐偏移结果仍与无界 dict 参考逐位一致。"""
+    from app.retouch import (
+        _BoundedLabCache, _feasible_offsets, _mean_lab_for_offset,
+        _mean_labs_for_offsets,
+    )
+    rng = np.random.default_rng(7)
+    # 内缩色带：宽偏移仍逐像素可行；高多样性：每个像素 CMYK 几乎都不同。
+    roi = rng.integers(16, 241, size=(12, 12, 4)).astype(np.uint8)
+    flat = np.ascontiguousarray(roi).reshape(-1, 4)
+    cands = _feasible_offsets(roi, max_shift=4, tac_limit=1020)
+    assert cands.shape[0] > 1000
+    press = lcms_native.build_demo_cmyk_profile_bytes()
+    with lcms_native.lab_transform("CMYK", press,
+                                   "relative_colorimetric") as xf:
+        ref = np.empty((cands.shape[0], 3))
+        unbounded: dict = {}
+        for i, off in enumerate(cands):
+            ref[i] = _mean_lab_for_offset(flat, off, xf, unbounded)
+        # 容量远小于搜索过程中出现的不同键数 -> 大量淘汰。
+        tiny = _BoundedLabCache(capacity=64)
+        got_batch = _mean_labs_for_offsets(flat, cands, xf, tiny, batch_size=8)
+        got_one = np.empty_like(ref)
+        for i, off in enumerate(cands):
+            got_one[i] = _mean_lab_for_offset(flat, off, xf,
+                                              _BoundedLabCache(capacity=64))
+    assert np.array_equal(got_batch, ref)
+    assert np.array_equal(got_one, ref)
+
+
+def test_vectorized_search_evaluates_all_feasible_offsets_bounded_memory():
+    """高多样性合法选区 + 宽偏移：全部可行偏移都被评估，常驻 Lab 缓存只占
+    固定槽位（修复前会累积成无界字典直至 OOM）。默认用 24×24 / shift=5
+    （14641 候选，搜索中出现的不同键远超缓存槽位，必然发生淘汰）；完整
+    64×64 / shift=8 的 83521 候选压力探查设 SPD_SLOW_RETOUCH=1 运行。"""
+    import os as _os
+    from app.retouch import (
+        _BoundedLabCache, _feasible_offsets, _mean_labs_for_offsets,
+    )
+    full_pressure = _os.environ.get("SPD_SLOW_RETOUCH") == "1"
+    side, shift, expect = (64, 8, 17 ** 4) if full_pressure else (24, 5, 11 ** 4)
+    rng = np.random.default_rng(0)
+    roi = rng.integers(16, 241, size=(side, side, 4)).astype(np.uint8)
+    flat = np.ascontiguousarray(roi).reshape(-1, 4)
+    cands = _feasible_offsets(roi, max_shift=shift, tac_limit=1020)
+    # 内缩色带使 -shift..+shift 全部合法且不触总墨量：完整候选空间。
+    assert cands.shape[0] == expect
+    press = lcms_native.build_demo_cmyk_profile_bytes()
+    with lcms_native.lab_transform("CMYK", press,
+                                   "relative_colorimetric") as xf:
+        cache = _BoundedLabCache()
+        fixed_bytes = cache.keys.nbytes + cache.labs.nbytes
+        means = _mean_labs_for_offsets(flat, cands, xf, cache)
+    # 每个候选都得到有限的平均 Lab（没有因去重/淘汰而漏算）。
+    assert means.shape == (expect, 3)
+    assert np.isfinite(means).all()
+    # 常驻缓存数组在处理远超槽位数的不同键之后仍是同一固定大小。
+    assert cache.keys.nbytes + cache.labs.nbytes == fixed_bytes
+    assert cache.keys.shape[0] == cache.capacity
+
+
+def _high_diversity_png(size=48, seed=11):
+    """噪点 RGB 图：经演示配置分色后选区墨色高度多样。"""
+    rng = np.random.default_rng(seed)
+    arr = rng.integers(0, 256, size=(size, size, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_high_diversity_selection_returns_report_preview_and_tiff(
+        client, ids, monkeypatch):
+    """合法高多样性选区 + 宽偏移可经 POST /api/retouch 返回报告/预览/成品，
+    不被系统杀掉；可达时 TIFF 选区外字节不变并嵌入原印刷 ICC。"""
+    from app import main
+    r = client.post(
+        "/api/jobs",
+        files={"image": ("noise.png", _high_diversity_png(), "image/png")},
+        data={
+            "source_profile": ids["srgb"],
+            "press_profile": ids["cmyk"],
+            "display_profile": ids["display"],
+            "threshold": "3",
+        },
+    )
+    assert r.status_code == 200, r.text
+    job_id = r.json()["job_id"]
+
+    # 把分色结果替换为“合法高多样性 + 内缩色带”的最坏形态：每个像素一个
+    # 独特 CMYK 四元组，且 -3..+3 偏移对全部像素逐通道可行、不触总墨量。
+    rng = np.random.default_rng(5)
+    cmyk_path = main.JOB_DIR / job_id / "cmyk.npy"
+    orig = np.load(cmyk_path)
+    side = 32
+    diverse = rng.integers(24, 233, size=(side, side, 4)).astype(np.uint8)
+    patched = orig.copy()
+    patched[:side, :side] = diverse
+    np.save(cmyk_path, patched)
+    try:
+        # 目标取“统一偏移 (2,-1,1,0) 后”的平均 Lab：必然可行且可达。
+        target = _mean_lab_of_offset(
+            client, ids, job_id, (0, 0, side, side), (2, -1, 1, 0))
+        resp = _retouch(
+            client, job_id, x=0, y=0, width=side, height=side,
+            target_lab=[float(v) for v in target],
+            tolerance_de=0.5, max_shift=3, tac_limit=1020,
+        )
+        assert resp.status_code == 200, resp.text
+        d = resp.json()
+        assert d["reachable"] is True
+        assert d["feasible_offset_count"] == 7 ** 4
+        assert d["rect"] == {"x": 0, "y": 0,
+                            "width": side, "height": side}
+        # 报告与修色前/后预览都可正常返回。
+        assert client.get(d["report_url"]).status_code == 200
+        assert client.get(d["images"]["before"]).status_code == 200
+        assert client.get(d["images"]["after"]).status_code == 200
+        # 成品 TIFF：选区外字节不变、嵌入原印刷 ICC。
+        tif_resp = client.get(d["tiff"])
+        assert tif_resp.status_code == 200
+        tif = np.asarray(Image.open(io.BytesIO(tif_resp.content)))
+        mask = np.zeros(patched.shape[:2], dtype=bool)
+        mask[:side, :side] = True
+        assert np.array_equal(tif[~mask], patched[~mask])
+        press = client.app.state.state.pm.load_bytes(ids["cmyk"])
+        with Image.open(io.BytesIO(tif_resp.content)) as im:
+            assert im.info.get("icc_profile") == press
+    finally:
+        np.save(cmyk_path, orig)
+
+
+def test_high_diversity_unreachable_returns_preview_without_tiff(client, ids):
+    """高多样性选区不可达时仍返回报告与预览，但不产出 TIFF。"""
+    from app import main
+    r = client.post(
+        "/api/jobs",
+        files={"image": ("noise.png", _high_diversity_png(seed=13),
+                         "image/png")},
+        data={
+            "source_profile": ids["srgb"],
+            "press_profile": ids["cmyk"],
+            "display_profile": ids["display"],
+            "threshold": "3",
+        },
+    )
+    job_id = r.json()["job_id"]
+    cmyk_path = main.JOB_DIR / job_id / "cmyk.npy"
+    orig = np.load(cmyk_path)
+    side = 20
+    rng = np.random.default_rng(9)
+    patched = orig.copy()
+    patched[:side, :side] = rng.integers(
+        16, 241, size=(side, side, 4)).astype(np.uint8)
+    np.save(cmyk_path, patched)
+    try:
+        # 极端目标 + 零偏移：不可能达标 -> 不可达。
+        resp = _retouch(
+            client, job_id, x=0, y=0, width=side, height=side,
+            target_lab=[100.0, 127.0, 127.0],
+            tolerance_de=0.0, max_shift=0, tac_limit=1020,
+        )
+        assert resp.status_code == 200, resp.text
+        d = resp.json()
+        assert d["reachable"] is False
+        assert d["tiff"] is None
+        assert client.get(d["images"]["before"]).status_code == 200
+        assert client.get(d["images"]["after"]).status_code == 200
+        assert client.get(
+            f"/api/retouch/{d['retouch_id']}/retouched.tif"
+        ).status_code == 422
+    finally:
+        np.save(cmyk_path, orig)

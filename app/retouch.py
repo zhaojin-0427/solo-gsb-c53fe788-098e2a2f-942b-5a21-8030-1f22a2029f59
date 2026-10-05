@@ -178,47 +178,230 @@ def _feasible_offsets(roi: np.ndarray, max_shift: int, tac_limit: int) -> np.nda
     return candidates[keep]
 
 
+# ---------------------------------------------------------------------------
+# CMYK -> Lab 回算的跨候选复用 / 淘汰边界
+#
+# 一次搜索（首次搜索，或缓存命中后的一次复核）内，相同的（偏移后）CMYK
+# 四元组只经 LittleCMS 回算一次；该复用**严格限定在单次请求内**——
+# ``_BoundedLabCache`` 是函数内的局部对象，请求（或一次复核）结束即随栈
+# 释放，进程里不存在跨请求常驻、持续增长的共享字典。
+#
+# 常驻条目数还有硬上限：高多样性选区（如随机噪点级 64×64）+ 宽偏移
+# （max_shift=8、TAC 放宽）时，逐偏移新见的 CMYK 四元组几乎两两不重叠，
+# 无界字典会在上万组候选上累积出数 GB、被系统直接杀掉。这里改用**固定
+# 槽位的直接映射（direct-mapped）哈希表**：每个键按位混合哈希到固定槽，
+# 槽被占用即覆盖淘汰旧键——常驻内存恒定，与候选数/像素多样性无关。
+# LittleCMS 对同一输入是确定纯函数，被淘汰的键再次出现时重算即可，结果
+# 与首次逐位相同，因此淘汰只影响速度、绝不改变任何候选的平均 Lab 数值。
+# 查表/写入全部为 NumPy 向量化操作，无逐键 Python 循环。
+# ---------------------------------------------------------------------------
+
+# 单次搜索常驻 Lab 缓存的槽位数（2 的幂）。131072 槽 × (8 位键 + 3×
+# float64 Lab) 约 4.3 MB，足以让真实（墨色高度相关）选区在相邻候选间充分
+# 命中；病态高多样性输入下槽位循环覆盖，常驻内存恒定。
+_MAX_LAB_CACHE_ENTRIES = 1 << 17
+# 向量化批量评估时每批候选数。批内 ``4096 像素 × _BATCH_OFFSETS`` 个偏移
+# 的键先在批内去重，再与常驻缓存比对，只把真正新见的键合并成一次
+# LittleCMS 批量回算。批大小只影响速度与批内临时张量规模（非常驻缓存
+# 上限）：取 64 时单批 ≤ 262144 行、去重前约 8 MB。
+_BATCH_OFFSETS = 64
+# Fibonacci 哈希乘子（2^64/φ），用于把 32 位 CMYK 打包键的各字节充分
+# 混合到槽位，避免“只低 17 位不同”的结构化键（如只变 K）挤到同一批槽。
+_HASH_MULT = np.uint64(0x9E3779B97F4A7C15)
+_EMPTY_KEY = np.uint64(0xFFFFFFFFFFFFFFFF)
+
+
+class _BoundedLabCache:
+    """单次请求内复用 CMYK→Lab、常驻条目受硬上限约束的直接映射缓存。
+
+    底层是两个固定长度 NumPy 数组：``keys``（uint64）与 ``labs``
+    （float64×3），槽位 ``hash(key) & mask`` 被占用即覆盖淘汰——这就是
+    跨候选结果的**淘汰边界**：超出固定槽位的旧结果不保留，需要时按同一
+    transform 重新回算（确定性纯函数，结果逐位一致）。
+
+    实例必须在单次请求内创建、用后即弃（首次搜索或一次复核各一个），从而
+    首次搜索与缓存命中复核的常驻缓存都受同一上限约束。
+
+    查询接口全部向量化：``lookup`` 批量取键，返回 ``(labs|None, hit_mask,
+    positions)``；调用方先用批内结果数组（而不是表本身）组装答案，再
+    ``insert`` 新键——这样同一批里哈希相撞的两个不同键也不会互相污染。
+    ``get``/``put`` 仅供单偏移复核等小规模调用使用。
+    """
+
+    __slots__ = ("keys", "labs", "mask", "capacity")
+
+    def __init__(self, capacity: int = _MAX_LAB_CACHE_ENTRIES):
+        cap = int(capacity)
+        self.keys = np.full(cap, _EMPTY_KEY, dtype=np.uint64)
+        self.labs = np.zeros((cap, 3), dtype=np.float64)
+        self.mask = np.uint64(cap - 1)
+        self.capacity = cap
+
+    def _positions(self, keys: np.ndarray) -> np.ndarray:
+        return ((keys.astype(np.uint64) * _HASH_MULT) & self.mask).astype(np.intp)
+
+    def lookup(self, keys: np.ndarray):
+        """批量查表。返回 ``(labs, hit, pos)``：命中行 labs 有效。"""
+        pos = self._positions(keys)
+        hit = self.keys[pos] == keys.astype(np.uint64)
+        return self.labs[pos], hit, pos
+
+    def insert(self, keys: np.ndarray, labs: np.ndarray, positions: np.ndarray,
+               hit: np.ndarray) -> None:
+        """把未命中的新键（及其 Lab）写入其固定槽，覆盖即淘汰旧键。"""
+        miss = ~hit
+        if not miss.any():
+            return
+        p = positions[miss]
+        self.keys[p] = keys[miss].astype(np.uint64)
+        self.labs[p] = labs[miss]
+
+    def get(self, key: int):
+        k = np.asarray([key], dtype=np.uint64)
+        labs, hit, _ = self.lookup(k)
+        return labs[0] if bool(hit[0]) else None
+
+    def put(self, key: int, lab: np.ndarray) -> None:
+        k = np.asarray([key], dtype=np.uint64)
+        labs, hit, pos = self.lookup(k)
+        if not bool(hit[0]):
+            self.insert(k, lab[None, :], pos, hit)
+
+
+def _pack_cmyk_keys(shifted: np.ndarray) -> np.ndarray:
+    """(N,4) uint8 CMYK -> (N,) uint64 打包键。"""
+    return (
+        shifted[..., 0].astype(np.uint64)
+        | (shifted[..., 1].astype(np.uint64) << 8)
+        | (shifted[..., 2].astype(np.uint64) << 16)
+        | (shifted[..., 3].astype(np.uint64) << 24)
+    )
+
+
+def _unpack_cmyk_keys(keys: np.ndarray) -> np.ndarray:
+    """(M,) uint64 打包键 -> (M,4) uint8 CMYK。"""
+    k = keys.astype(np.uint64)
+    return np.stack(
+        [(k & 255).astype(np.uint8),
+         ((k >> 8) & 255).astype(np.uint8),
+         ((k >> 16) & 255).astype(np.uint8),
+         ((k >> 24) & 255).astype(np.uint8)],
+        axis=1,
+    )
+
+
 def _mean_lab_for_offset(
     flat_cmyk: np.ndarray,
     offset: np.ndarray,
     lab_xf,
-    lab_cache: dict[int, np.ndarray],
+    lab_cache,
 ) -> np.ndarray:
-    """偏移后选区 CMYK -> 像素加权平均 Lab（D50 double）。
+    """单个偏移后选区 CMYK -> 像素加权平均 Lab（D50 double）。
 
-    相同（偏移后）CMYK 四元组只让 LittleCMS 回算一次；相邻候选间大量重叠的
-    油墨组合直接在 ``lab_cache`` 命中，使平坦/重复色区域的搜索非常便宜。
-    查表/加权均为 NumPy 操作，无逐像素 Python 循环。
+    相同（偏移后）CMYK 四元组只让 LittleCMS 回算一次：先在批内去重，再查
+    有界缓存，仅对新见键回算。``lab_cache`` 可以是 :class:`_BoundedLabCache`
+    （有界、淘汰后重算结果不变）或普通 dict（测试/小规模路径）。
     """
     shifted = np.clip(
         flat_cmyk.astype(np.int32) + offset[None, :].astype(np.int32), 0, 255
     ).astype(np.uint8)
 
-    keys = (
-        shifted[:, 0].astype(np.uint64)
-        | (shifted[:, 1].astype(np.uint64) << 8)
-        | (shifted[:, 2].astype(np.uint64) << 16)
-        | (shifted[:, 3].astype(np.uint64) << 24)
-    )
-    unique_keys, inverse, counts = np.unique(
-        keys, return_inverse=True, return_counts=True
-    )
+    keys = _pack_cmyk_keys(shifted)
+    unique_keys, counts = np.unique(keys, return_counts=True)
 
-    key_list = unique_keys.tolist()
-    missing_idx = [i for i, k in enumerate(key_list) if k not in lab_cache]
-    if missing_idx:
-        miss = np.empty((len(missing_idx), 4), dtype=np.uint8)
-        for row, i in enumerate(missing_idx):
-            k = key_list[i]
-            miss[row] = (k & 255, (k >> 8) & 255,
-                         (k >> 16) & 255, (k >> 24) & 255)
-        labs = lab_xf(miss)
-        for i, lab in zip(missing_idx, labs):
-            lab_cache[key_list[i]] = lab
+    if isinstance(lab_cache, _BoundedLabCache):
+        cached_labs, hit, pos = lab_cache.lookup(unique_keys)
+        if not hit.all():
+            miss_keys = unique_keys[~hit]
+            miss_labs = lab_xf(_unpack_cmyk_keys(miss_keys))
+            # 用批内结果组装唯一键 Lab：先把新键结果放进临时数组，避免同批
+            # 哈希相撞的两键经覆盖相互污染；随后再整体写入常驻缓存。
+            unique_lab = cached_labs.copy()
+            unique_lab[~hit] = miss_labs
+            lab_cache.insert(unique_keys, unique_lab, pos, hit)
+        else:
+            unique_lab = cached_labs
+    else:
+        missing = [k for k in unique_keys.tolist() if k not in lab_cache]
+        if missing:
+            miss_keys = np.asarray(missing, dtype=np.uint64)
+            for k, lab in zip(miss_keys.tolist(),
+                             lab_xf(_unpack_cmyk_keys(miss_keys))):
+                lab_cache[int(k)] = lab
+        unique_lab = np.stack([lab_cache[int(k)] for k in unique_keys.tolist()])
 
-    unique_lab = np.stack([lab_cache[k] for k in key_list])
     weights = (counts.astype(np.float64) / counts.sum())[:, None]
     return (unique_lab * weights).sum(axis=0)
+
+
+def _mean_labs_for_offsets(
+    flat_cmyk: np.ndarray,
+    offsets: np.ndarray,
+    lab_xf,
+    lab_cache: _BoundedLabCache,
+    batch_size: int = _BATCH_OFFSETS,
+) -> np.ndarray:
+    """评估**全部**可行偏移的选区平均 Lab，分块向量化且常驻缓存受上限约束。
+
+    返回 ``(N, 3)`` float64，行序与 ``offsets`` 一一对应；N 可为 0。
+
+    与逐偏移 :func:`_mean_lab_for_offset` 数值等价：对每个候选，偏移后选区
+    的相同 CMYK 键只回算一次，平均 Lab = ``Σ(唯一键 Lab × 出现次数 /
+    像素数)``，且唯一键按 ``np.unique`` 升序、逐项 ``lab*count/total``
+    累加——与原逐偏移实现**同一求和次序**，因此小选区数值逐位一致。不同之
+    处只在执行方式：
+
+    * 每批把多个候选的偏移后像素一次展开（``(b,P,4)``），键先在**批内**
+      ``np.unique`` 去重，再向量化查常驻有界缓存，只把真正新见的键合并成
+      **一次** LittleCMS 批量回算——高多样性选区从上万次千行调用降为
+      数百次万级行调用，且仍覆盖全部可行偏移，一个不少；
+    * 新见键写入固定槽位的直接映射缓存，槽位被占用即覆盖淘汰。被淘汰键在
+      后续批重算即可（transform 确定，重算逐位相同），常驻内存因此恒受
+      硬上限约束，而每个候选的平均 Lab 与无界缓存完全一致。
+    """
+    n_pixels = flat_cmyk.shape[0]
+    n_cand = offsets.shape[0]
+    mean_labs = np.empty((n_cand, 3), dtype=np.float64)
+    if n_cand == 0:
+        return mean_labs
+
+    flat32 = flat_cmyk.astype(np.int32)
+    total_px = float(n_pixels)
+
+    for start in range(0, n_cand, batch_size):
+        end = min(start + batch_size, n_cand)
+        boff = offsets[start:end].astype(np.int32)
+        b = boff.shape[0]
+        # (b, P, 4)：批内每个候选的偏移后选区（clamp 与逐偏移实现一致）。
+        shifted = np.clip(
+            flat32[None, :, :] + boff[:, None, :], 0, 255
+        ).astype(np.uint8)
+        # 批内所有键一次去重（跨候选 + 候选内），是 LittleCMS 回算的最小集。
+        keys_2d = _pack_cmyk_keys(shifted)  # (b, P)
+        all_keys = keys_2d.reshape(-1)
+        batch_uniq = np.unique(all_keys)
+
+        cached_labs, hit, pos = lab_cache.lookup(batch_uniq)
+        if hit.all():
+            batch_lab = cached_labs
+        else:
+            miss_keys = batch_uniq[~hit]
+            miss_labs = lab_xf(_unpack_cmyk_keys(miss_keys))
+            # 先用批内结果组装答案，再写常驻缓存，避免同批哈希相撞污染。
+            batch_lab = cached_labs.copy()
+            batch_lab[~hit] = miss_labs
+            lab_cache.insert(batch_uniq, batch_lab, pos, hit)
+
+        # 每个候选独立按“升序唯一键 × 出现次数 / 像素总数”求和，保持与原
+        # 逐偏移实现相同的项与累加次序（逐项 lab*count/total 后顺序相加）。
+        for ci in range(b):
+            u_c, counts_c = np.unique(keys_2d[ci], return_counts=True)
+            loc = np.searchsorted(batch_uniq, u_c)
+            labs_c = batch_lab[loc]
+            w = (counts_c.astype(np.float64) / total_px)[:, None]
+            mean_labs[start + ci] = (labs_c * w).sum(axis=0)
+
+    return mean_labs
 
 
 def clip_region(cmyk_full: np.ndarray, req: RetouchRequest) -> tuple[int, int, int, int]:
@@ -299,10 +482,12 @@ def run_retouch(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
         de_before_target = float(colorscience.ciede2000(
             target[None, None, :], baseline_mean_lab[None, None, :])[0, 0])
 
-        lab_cache: dict[int, np.ndarray] = {}
-        mean_labs = np.empty((candidates.shape[0], 3), dtype=np.float64)
-        for gi, off in enumerate(candidates):
-            mean_labs[gi] = _mean_lab_for_offset(flat, off, lab_xf, lab_cache)
+        # 单次请求私有的有界 Lab 缓存：跨候选复用偏移后 CMYK 的回算结果，
+        # 用后即随本次搜索释放；条目数受固定槽位硬上限约束（高多样性选区 +
+        # 宽偏移也不会累积成数 GB 字典）。首次搜索仍逐一评估**全部**可行
+        # 偏移（分块向量化，一个不少）。
+        lab_cache = _BoundedLabCache()
+        mean_labs = _mean_labs_for_offsets(flat, candidates, lab_xf, lab_cache)
 
         # 一次性向量化计算全部候选对目标的 ΔE00（colorscience 与主流水线相同）。
         n_cand = candidates.shape[0]
@@ -695,15 +880,24 @@ def verify_cache(report: object, retouch_id: str, fingerprint: dict,
                         [candidates[near],
                          candidates[::step][:_SAMPLE_CANDIDATES]], axis=0
                     ), axis=0)
-                lab_cache: dict[int, np.ndarray] = {}
-                decorated = []
-                for off in sample:
-                    mean_lab = _mean_lab_for_offset(flat, off, lab_xf, lab_cache)
-                    de_off = float(colorscience.ciede2000(
-                        target[None, None, :], mean_lab[None, None, :])[0, 0])
-                    decorated.append(
-                        (de_off, int(np.abs(off.astype(np.int32)).sum()),
-                         tuple(int(v) for v in off)))
+                # 一次复核私有的有界缓存（与首次搜索同样的复用/淘汰边界），
+                # 分块向量化评估样本候选，避免高多样性选区在此累积无界字典。
+                verify_cache_lab = _BoundedLabCache()
+                sample_means = _mean_labs_for_offsets(
+                    flat, sample, lab_xf, verify_cache_lab
+                )
+                n_sample = sample.shape[0]
+                de_sample = colorscience.ciede2000(
+                    np.repeat(target[None, :], n_sample, axis=0).reshape(
+                        n_sample, 1, 3),
+                    sample_means.reshape(n_sample, 1, 3),
+                ).reshape(n_sample)
+                decorated = [
+                    (float(de_sample[i]),
+                     int(np.abs(sample[i].astype(np.int32)).sum()),
+                     tuple(int(v) for v in sample[i]))
+                    for i in range(n_sample)
+                ]
                 decorated.sort(key=lambda t: (t[0], t[1], t[2]))
                 # 报告偏移的 ΔE00 在同一 transform 下按相同输入重算，与候选
                 # 评估完全一致（同一 mean-Lab、同一 ΔE 公式），浮点结果按位
